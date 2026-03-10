@@ -15,18 +15,46 @@ from dataclasses import dataclass, asdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from kernels import get_kernel
 
 cap = torch.cuda.get_device_capability()
-use_fa3 = cap == (9, 0)  # Hopper only
+major, minor = cap
+fa3 = None
+backend_msg = ""
 
-if use_fa3:
-    from kernels import get_kernel
-    repo = "varunneal/flash-attention-3"
-    fa3 = get_kernel(repo).flash_attn_interface
-    print(f"Using FA3 backend from {repo} on GPU capability {cap}")
+# 1. Map architecture to the correct high-performance backend
+# Note than much further down we set WINDOW_PATTERN based on fa3 value set here
+if major >= 10: 
+    # Blackwell (RTX 5090 / SM 120 / SM 100)
+    try:
+        from flash_attn_4 import flash_attn_interface
+        fa3 = flash_attn_interface
+        backend_msg = f"Using Flash Attention 4 (Blackwell) on {cap}"
+    except ImportError:
+        backend_msg = f"Flash Attention 4 not found. Blackwell {cap} falling back to SDPA."
+
+elif major == 9: 
+    # Hopper (H100 / SM 90)
+    try:
+        repo = "varunneal/flash-attention-3"
+        fa3 = get_kernel(repo).flash_attn_interface
+        backend_msg = f"Using FA3 backend from {repo} on {cap}"
+    except Exception as e:
+        backend_msg = f"Failed to load Hopper kernel: {e}. Falling back to SDPA."
+
+elif major == 8: 
+    # Ampere (A100, RTX 30-series / SM 80, 86)
+    try:
+        repo = "kernels-community/flash-attn3"
+        fa3 = get_kernel(repo).flash_attn_interface
+        backend_msg = f"Using FA3 backend from {repo} on {cap}"
+    except Exception as e:
+        backend_msg = f"Failed to load Ampere kernel: {e}. Falling back to SDPA."
+
 else:
-    fa3 = None
-    print(f"Using PyTorch SDPA fallback on GPU capability {cap}")
+    # Older architectures (Turing and earlier)
+    backend_msg = f"No specialized FA3/4 kernel for architecture {cap}. Using SDPA fallback."
+
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -449,7 +477,15 @@ class MuonAdamW(torch.optim.Optimizer):
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "L"    # SPDA fallback; use full attention. was: 'SSSL' # sliding window pattern: L=full, S=half context
+
+# Set the window pattern dynamically based on fa3 set near start of code
+if fa3 is not None:
+    # Use the optimizedc sliding window pattern because we have a kernel that supports it
+    WINDOW_PATTERN = "SSSL" 
+else:
+    # Use the safe fallback for SDPA 
+    WINDOW_PATTERN = "L" 
+print(f"Using this WINDOW_PATTERN: {WINDOW_PATTERN}")
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
